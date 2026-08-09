@@ -1,0 +1,25 @@
+# Build output
+bin/
+obj/
+out/
+TestResults/
+
+# Visual Studio / IDE user state
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.csproj.user
+*.DotSettings.user
+
+# Restore/build cache
+packages/
+*.nupkg
+*.snupkg
+
+# Optional: keep generated debug/runtime files out if they escape bin/
+*.pdb
+*.deps.json
+*.runtimeconfig.json
