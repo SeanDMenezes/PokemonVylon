@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using PokemonVylon.UpdateIndex;
 
 if (args.Length != 4)
 {
@@ -229,8 +230,9 @@ await WriteJsonAsync(
 // Create ZIP
 string zipPath = Path.Combine(
     Path.GetDirectoryName(newFolder)!,
-    $"PokemonVylon-v{toVersion}.patch.zip"
-);
+    UpdateIndexNaming.GetPatchZipFileName(fromVersion, toVersion));
+
+string updateIndexPath = UpdateIndexNaming.GetIndexPath(Path.GetDirectoryName(newFolder)!);
 
 if (File.Exists(zipPath))
 {
@@ -244,11 +246,23 @@ ZipFile.CreateFromDirectory(
     false
 );
 
+string zipSha256 = CalculateSha256(zipPath);
+string assetName = Path.GetFileName(zipPath);
+string releaseTag = UpdateIndexNaming.GetDefaultReleaseTag(toVersion);
+
+UpdateIndexManifest updateIndex = UpdateIndexBuilder.LoadOrCreate(updateIndexPath);
+UpdateIndexBuilder.UpsertEdge(
+    updateIndex,
+    UpdateIndexBuilder.CreateEdge(fromVersion, toVersion, assetName, releaseTag, zipSha256));
+UpdateIndexBuilder.ApplyRelease(updateIndex, fromVersion, toVersion);
+await UpdateIndexBuilder.SaveAsync(updateIndex, updateIndexPath);
+
 Console.WriteLine();
 Console.WriteLine("Patch created!");
 Console.WriteLine();
-Console.WriteLine($"Patch: {zipPath}");
-Console.WriteLine($"Size:  {new FileInfo(zipPath).Length / 1024.0 / 1024.0:F2} MB");
+Console.WriteLine($"Patch:        {zipPath}");
+Console.WriteLine($"Update index: {updateIndexPath}");
+Console.WriteLine($"Size:         {new FileInfo(zipPath).Length / 1024.0 / 1024.0:F2} MB");
 
 static bool IsValidVersion(string value)
 {

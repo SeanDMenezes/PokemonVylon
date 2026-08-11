@@ -4,11 +4,13 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using PokemonVylon.UpdateIndex;
 
 internal static class Program
 {
     private const string GitHubOwner = "SeanDMenezes";
     private const string GitHubRepo = "PokemonVylon";
+    private const string UpdaterStagingDirectoryName = ".updater-staging";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -18,7 +20,7 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
-        Console.WriteLine("Pokemon Vylon Updater - Phase 1 Core Implementation");
+        Console.WriteLine("Pokemon Vylon Updater - Phase 2 Update Index");
 
         string gameDirectory = AppContext.BaseDirectory;
         string gameExePath = Path.Combine(gameDirectory, "Game.exe");
@@ -71,68 +73,77 @@ internal static class Program
             return 1;
         }
 
-        string latestVersion = NormalizeVersion(latestRelease.TagName);
+        string latestVersion = VersionComparer.Normalize(latestRelease.TagName);
         Console.WriteLine($"Latest GitHub tag: {latestRelease.TagName} ({latestVersion})");
 
-        if (CompareVersions(latestVersion, installedVersion) <= 0)
+        if (VersionComparer.Compare(latestVersion, installedVersion) <= 0)
         {
             Console.WriteLine("No update is available for the installed version.");
             return 0;
         }
 
-        GitHubAsset? asset = SelectPatchAsset(latestRelease, latestVersion);
-        if (asset is null)
-        {
-            Console.Error.WriteLine("No direct release asset matching a patch package could be found for the latest release.");
-            return 1;
-        }
-
-        Console.WriteLine($"Selected patch asset: {asset.Name}");
-
         string tempRoot = Path.Combine(Path.GetTempPath(), "PokemonVylonUpdater", latestVersion);
         Directory.CreateDirectory(tempRoot);
 
-        string zipDownloadPath = Path.Combine(tempRoot, asset.Name);
-        string extractedPatchDirectory = Path.Combine(tempRoot, "patch");
-
         try
         {
-            await DownloadAssetAsync(asset.BrowserDownloadUrl, zipDownloadPath);
+            UpdateIndexManifest updateIndex = await LoadUpdateIndexAsync(latestRelease, tempRoot);
+            Console.WriteLine(
+                $"Loaded update index with {updateIndex.Edges.Count} edge(s). Minimum supported: {updateIndex.MinimumSupported}");
 
-            VerifyAssetDigest(zipDownloadPath, asset.Digest);
-
-            if (Directory.Exists(extractedPatchDirectory))
+            if (!string.IsNullOrWhiteSpace(updateIndex.MinimumSupported)
+                && VersionComparer.Compare(installedVersion, updateIndex.MinimumSupported) < 0)
             {
-                Directory.Delete(extractedPatchDirectory, true);
+                Console.Error.WriteLine(
+                    $"Installed version '{installedVersion}' is older than the minimum supported version '{updateIndex.MinimumSupported}'. Reinstall the game from scratch.");
+                return 1;
             }
 
-            ZipFile.ExtractToDirectory(zipDownloadPath, extractedPatchDirectory, overwriteFiles: true);
+            IReadOnlyList<UpdateIndexEdge>? updatePath = UpdateIndexPathfinder.FindShortestPath(
+                updateIndex,
+                installedVersion,
+                latestVersion);
 
-            string patchJsonPath = Path.Combine(extractedPatchDirectory, "patch.json");
-            if (!File.Exists(patchJsonPath))
+            if (updatePath is null || updatePath.Count == 0)
             {
-                throw new InvalidOperationException("The downloaded patch archive does not contain patch.json.");
+                Console.Error.WriteLine(
+                    $"No update path could be resolved from installed version '{installedVersion}' to latest '{latestVersion}'.");
+                return 1;
             }
 
-            PatchManifest patch = LoadPatchManifest(patchJsonPath);
-            if (!string.Equals(patch.FromVersion, installedVersion, StringComparison.OrdinalIgnoreCase))
+            Console.WriteLine($"Resolved update path with {updatePath.Count} hop(s):");
+            foreach (UpdateIndexEdge hop in updatePath)
+            {
+                Console.WriteLine($"  {hop.FromVersion} -> {hop.ToVersion} ({hop.AssetName})");
+            }
+
+            string currentVersion = installedVersion;
+            for (int hopIndex = 0; hopIndex < updatePath.Count; hopIndex++)
+            {
+                UpdateIndexEdge hop = updatePath[hopIndex];
+                Console.WriteLine();
+                Console.WriteLine($"Applying hop {hopIndex + 1}/{updatePath.Count}: {hop.FromVersion} -> {hop.ToVersion}");
+
+                if (!string.Equals(hop.FromVersion, currentVersion, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"Update path mismatch: expected to apply from '{currentVersion}', but the next hop starts at '{hop.FromVersion}'.");
+                }
+
+                currentVersion = await ApplyIndexedPatchHopAsync(
+                    gameDirectory,
+                    hop,
+                    tempRoot,
+                    hopIndex);
+            }
+
+            if (VersionComparer.Compare(currentVersion, latestVersion) < 0)
             {
                 throw new InvalidOperationException(
-                    $"Patch manifest rejected: patch.fromVersion '{patch.FromVersion}' does not match installed version '{installedVersion}'.");
+                    $"Update path completed at '{currentVersion}', but latest release is '{latestVersion}'.");
             }
 
-            if (!string.Equals(patch.ToVersion, latestVersion, StringComparison.OrdinalIgnoreCase))
-            {
-                Console.WriteLine(
-                    $"Selected release target version '{latestVersion}' differs from patch manifest target '{patch.ToVersion}'. Continuing with manifest target '{patch.ToVersion}'.");
-            }
-
-            VerifyPatchFiles(extractedPatchDirectory, patch);
-
-            ApplyPatch(gameDirectory, extractedPatchDirectory, patch);
-            VerifyInstalledGameFiles(gameDirectory, patch);
-
-            WriteInstalledVersion(gameDirectory, patch.ToVersion);
+            await StageSelfUpdateBinaryAsync(latestRelease, gameDirectory);
 
             string gameExeFinalPath = Path.Combine(gameDirectory, "Game.exe");
             if (File.Exists(gameExeFinalPath))
@@ -228,31 +239,94 @@ internal static class Program
         return JsonSerializer.Deserialize<GitHubRelease>(payload, JsonOptions);
     }
 
-    private static GitHubAsset? SelectPatchAsset(GitHubRelease release, string latestVersion)
+    private static async Task<UpdateIndexManifest> LoadUpdateIndexAsync(GitHubRelease release, string tempRoot)
     {
-        if (release.Assets is null || release.Assets.Count == 0)
+        GitHubAsset? indexAsset = release.Assets.FirstOrDefault(asset =>
+            asset.Name.Equals(UpdateIndexConstants.FileName, StringComparison.OrdinalIgnoreCase));
+
+        if (indexAsset is null)
         {
-            return null;
+            throw new InvalidOperationException(
+                $"Latest release is missing required asset '{UpdateIndexConstants.FileName}'.");
         }
 
-        string latestVersionNoV = NormalizeVersion(latestVersion);
+        string indexDownloadPath = Path.Combine(tempRoot, UpdateIndexConstants.FileName);
+        await DownloadAssetAsync(indexAsset.BrowserDownloadUrl, indexDownloadPath);
 
-        foreach (GitHubAsset asset in release.Assets)
+        string json = await File.ReadAllTextAsync(indexDownloadPath);
+        UpdateIndexManifest? index = JsonSerializer.Deserialize<UpdateIndexManifest>(json, JsonOptions);
+        if (index is null || index.Edges.Count == 0)
         {
-            if (!asset.Name.EndsWith(".patch.zip", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            if (asset.Name.Contains(latestVersionNoV, StringComparison.OrdinalIgnoreCase)
-                || asset.Name.Contains(latestVersion, StringComparison.OrdinalIgnoreCase)
-                || asset.Name.Contains("v" + latestVersionNoV, StringComparison.OrdinalIgnoreCase))
-            {
-                return asset;
-            }
+            throw new InvalidOperationException("update-index.json is missing or contains no update edges.");
         }
 
-        return release.Assets.FirstOrDefault(asset => asset.Name.EndsWith(".patch.zip", StringComparison.OrdinalIgnoreCase));
+        return index;
+    }
+
+    private static async Task<string> ApplyIndexedPatchHopAsync(
+        string gameDirectory,
+        UpdateIndexEdge hop,
+        string tempRoot,
+        int hopIndex)
+    {
+        string hopDirectory = Path.Combine(tempRoot, $"hop-{hopIndex}-{hop.ToVersion}");
+        string zipDownloadPath = Path.Combine(hopDirectory, hop.AssetName);
+        string extractedPatchDirectory = Path.Combine(hopDirectory, "extract");
+
+        if (Directory.Exists(hopDirectory))
+        {
+            Directory.Delete(hopDirectory, true);
+        }
+
+        Directory.CreateDirectory(hopDirectory);
+
+        string downloadUrl = UpdateIndexNaming.BuildReleaseDownloadUrl(GitHubOwner, GitHubRepo, hop);
+        Console.WriteLine($"Downloading patch asset: {hop.AssetName}");
+        await DownloadAssetAsync(downloadUrl, zipDownloadPath);
+
+        if (!string.IsNullOrWhiteSpace(hop.Sha256))
+        {
+            string actual = CalculateSha256(zipDownloadPath);
+            if (!string.Equals(actual, hop.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Patch asset SHA-256 mismatch for '{hop.AssetName}'. Expected {hop.Sha256}, got {actual}.");
+            }
+
+            Console.WriteLine("Patch asset SHA-256 verified from update index.");
+        }
+        else
+        {
+            Console.WriteLine("Patch asset SHA-256 is not listed in update-index.json; digest verification is skipped.");
+        }
+
+        ZipFile.ExtractToDirectory(zipDownloadPath, extractedPatchDirectory, overwriteFiles: true);
+
+        string patchJsonPath = Path.Combine(extractedPatchDirectory, "patch.json");
+        if (!File.Exists(patchJsonPath))
+        {
+            throw new InvalidOperationException("The downloaded patch archive does not contain patch.json.");
+        }
+
+        PatchManifest patch = LoadPatchManifest(patchJsonPath);
+        if (!string.Equals(patch.FromVersion, hop.FromVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Patch manifest rejected: patch.fromVersion '{patch.FromVersion}' does not match expected '{hop.FromVersion}'.");
+        }
+
+        if (!string.Equals(patch.ToVersion, hop.ToVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Patch manifest rejected: patch.toVersion '{patch.ToVersion}' does not match expected '{hop.ToVersion}'.");
+        }
+
+        VerifyPatchFiles(extractedPatchDirectory, patch);
+        ApplyPatch(gameDirectory, extractedPatchDirectory, patch);
+        VerifyInstalledGameFiles(gameDirectory, patch);
+        WriteInstalledVersion(gameDirectory, patch.ToVersion);
+
+        return patch.ToVersion;
     }
 
     private static async Task DownloadAssetAsync(string url, string destinationPath)
@@ -436,46 +510,55 @@ internal static class Program
         return false;
     }
 
-    private static string NormalizeVersion(string value)
+    private static async Task StageSelfUpdateBinaryAsync(GitHubRelease release, string gameDirectory)
     {
-        if (string.IsNullOrWhiteSpace(value))
+        GitHubAsset? updaterAsset = release.Assets.FirstOrDefault(asset =>
+            asset.Name.Equals("Updater.exe", StringComparison.OrdinalIgnoreCase));
+
+        if (updaterAsset is null)
         {
-            return string.Empty;
+            Console.WriteLine("No Updater.exe self-update asset is present in the latest GitHub release.");
+            return;
         }
 
-        string sanitized = value.Trim();
-        if (sanitized.StartsWith('v') || sanitized.StartsWith('V'))
+        string stagingDirectory = Path.Combine(gameDirectory, UpdaterStagingDirectoryName);
+        Directory.CreateDirectory(stagingDirectory);
+        string stagedUpdaterPath = Path.Combine(stagingDirectory, updaterAsset.Name);
+
+        await DownloadAssetAsync(updaterAsset.BrowserDownloadUrl, stagedUpdaterPath);
+        VerifyAssetDigest(stagedUpdaterPath, updaterAsset.Digest);
+
+        string bootstrapExe = Path.Combine(gameDirectory, "UpdaterBootstrap.exe");
+        if (!File.Exists(bootstrapExe))
         {
-            sanitized = sanitized.Substring(1);
+            Console.WriteLine(
+                $"Bootstrapper '{bootstrapExe}' is not present in the game directory. Self-update payload was downloaded and staged at '{stagedUpdaterPath}' but cannot be swapped into place.");
+            return;
         }
 
-        return sanitized;
+        string? currentUpdaterPath = Process.GetCurrentProcess().MainModule?.FileName;
+        if (string.IsNullOrWhiteSpace(currentUpdaterPath))
+        {
+            currentUpdaterPath = Path.Combine(gameDirectory, "Updater.exe");
+        }
+
+        int currentProcessId = Environment.ProcessId;
+
+        Console.WriteLine($"Launching bootstrap handoff for '{currentUpdaterPath}' -> '{stagedUpdaterPath}' (current pid {currentProcessId})");
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = bootstrapExe,
+            Arguments = $"\"{currentUpdaterPath}\" \"{stagedUpdaterPath}\" {currentProcessId} --no-relaunch",
+            UseShellExecute = true
+        });
+
+        Console.WriteLine($"Staged new updater binary: {stagedUpdaterPath}");
     }
 
-    private static int CompareVersions(string left, string right)
-    {
-        string[] leftParts = NormalizeVersion(left).Split('.', StringSplitOptions.RemoveEmptyEntries);
-        string[] rightParts = NormalizeVersion(right).Split('.', StringSplitOptions.RemoveEmptyEntries);
+    private static string NormalizeVersion(string value) => VersionComparer.Normalize(value);
 
-        int length = Math.Max(leftParts.Length, rightParts.Length);
-        for (int i = 0; i < length; i++)
-        {
-            int leftNumber = i < leftParts.Length && int.TryParse(leftParts[i], out int leftParsed) ? leftParsed : 0;
-            int rightNumber = i < rightParts.Length && int.TryParse(rightParts[i], out int rightParsed) ? rightParsed : 0;
-
-            if (leftNumber < rightNumber)
-            {
-                return -1;
-            }
-
-            if (leftNumber > rightNumber)
-            {
-                return 1;
-            }
-        }
-
-        return 0;
-    }
+    private static int CompareVersions(string left, string right) => VersionComparer.Compare(left, right);
 
     private static string CalculateSha256(string path)
     {

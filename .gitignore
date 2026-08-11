@@ -3,6 +3,7 @@ bin/
 obj/
 out/
 TestResults/
+artifacts/
 
 # Visual Studio / IDE user state
 .vs/
