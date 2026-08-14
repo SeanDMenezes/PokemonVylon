@@ -390,21 +390,10 @@ static Dictionary<string, FileSnapshot> GetFiles(string folder)
         string relativePath = Path.GetRelativePath(folder, filePath)
             .Replace('\\', '/');
 
-        if (string.Equals(
-                Path.GetFileName(relativePath),
-                "manifest.json",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            continue;
-        }
-
-        if (string.Equals(
-                Path.GetFileName(relativePath),
-                "patch.json",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            continue;
-        }
+    if (PatchExclusions.IsExcluded(relativePath))
+    {
+        continue;
+    }
 
         FileInfo info = new FileInfo(filePath);
 

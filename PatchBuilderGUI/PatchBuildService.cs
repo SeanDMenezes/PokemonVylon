@@ -337,9 +337,7 @@ static class PatchBuildService
             string relativePath = Path.GetRelativePath(folder, filePath)
                 .Replace('\\', '/');
 
-            string fileName = Path.GetFileName(relativePath);
-            if (string.Equals(fileName, "manifest.json", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(fileName, "patch.json", StringComparison.OrdinalIgnoreCase))
+            if (PatchExclusions.IsExcluded(relativePath))
             {
                 continue;
             }

@@ -11,6 +11,12 @@ internal static class Program
     private const string GitHubOwner = "SeanDMenezes";
     private const string GitHubRepo = "PokemonVylon";
     private const string UpdaterStagingDirectoryName = ".updater-staging";
+    private const string WindowsUpdaterAssetName = "Updater.exe";
+    private const string LinuxUpdaterAssetName = "Updater-linux-x64";
+
+    // The updater ships from a fixed tag rather than the latest game release, so a user
+    // who multi-hops across several versions still converges on the current binary.
+    private const string SelfUpdateReleaseTag = "tools";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -38,10 +44,19 @@ internal static class Program
             return 1;
         }
 
-        if (IsGameRunning(gameExePath))
+        if (OperatingSystem.IsWindows())
         {
-            Console.Error.WriteLine("Game.exe is currently running. Close the game before applying an update.");
-            return 1;
+            if (IsGameRunning(gameExePath))
+            {
+                Console.Error.WriteLine("Game.exe is currently running. Close the game before applying an update.");
+                return 1;
+            }
+        }
+        else
+        {
+            // Under Proton the game is a Wine-hosted process, so it does not surface
+            // under its own name and cannot be detected the way it is on Windows.
+            Console.WriteLine("WARNING: close the game before continuing. This build cannot detect a running game on this platform.");
         }
 
         string installedVersion;
@@ -79,6 +94,7 @@ internal static class Program
         if (VersionComparer.Compare(latestVersion, installedVersion) <= 0)
         {
             Console.WriteLine("No update is available for the installed version.");
+            await TrySelfUpdateAsync(gameDirectory);
             return 0;
         }
 
@@ -143,10 +159,15 @@ internal static class Program
                     $"Update path completed at '{currentVersion}', but latest release is '{latestVersion}'.");
             }
 
-            await StageSelfUpdateBinaryAsync(latestRelease, gameDirectory);
-
             string gameExeFinalPath = Path.Combine(gameDirectory, "Game.exe");
-            if (File.Exists(gameExeFinalPath))
+            if (!File.Exists(gameExeFinalPath))
+            {
+                throw new FileNotFoundException("Game.exe was missing after the update process.");
+            }
+
+            await TrySelfUpdateAsync(gameDirectory);
+
+            if (OperatingSystem.IsWindows())
             {
                 Console.WriteLine($"Launching {gameExeFinalPath}");
                 Process.Start(new ProcessStartInfo
@@ -157,7 +178,9 @@ internal static class Program
             }
             else
             {
-                throw new FileNotFoundException("Game.exe was missing after the update process.");
+                // Game.exe is a Windows binary served by Proton/Wine, and this process
+                // cannot reconstruct the launcher command the player actually uses.
+                Console.WriteLine("Launch the game the way you normally do; this platform cannot start it for you.");
             }
 
             Console.WriteLine("Update completed successfully.");
@@ -219,14 +242,19 @@ internal static class Program
         File.WriteAllText(versionJsonPath, json);
     }
 
-    private static async Task<GitHubRelease?> QueryLatestReleaseAsync()
+    private static Task<GitHubRelease?> QueryLatestReleaseAsync() =>
+        QueryReleaseAsync($"https://api.github.com/repos/{GitHubOwner}/{GitHubRepo}/releases/latest");
+
+    private static Task<GitHubRelease?> QueryReleaseByTagAsync(string tag) =>
+        QueryReleaseAsync($"https://api.github.com/repos/{GitHubOwner}/{GitHubRepo}/releases/tags/{tag}");
+
+    private static async Task<GitHubRelease?> QueryReleaseAsync(string url)
     {
         using HttpClient client = new();
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
         client.DefaultRequestHeaders.UserAgent.ParseAdd("PokemonVylonUpdater/1.0");
 
-        string url = $"https://api.github.com/repos/{GitHubOwner}/{GitHubRepo}/releases/latest";
         HttpResponseMessage response = await client.GetAsync(url);
 
         if (!response.IsSuccessStatusCode)
@@ -510,14 +538,59 @@ internal static class Program
         return false;
     }
 
-    private static async Task StageSelfUpdateBinaryAsync(GitHubRelease release, string gameDirectory)
+    private static string GetUpdaterAssetName() =>
+        OperatingSystem.IsWindows() ? WindowsUpdaterAssetName : LinuxUpdaterAssetName;
+
+    /// <summary>
+    /// Must be called immediately before the updater exits. On Windows the swap is performed
+    /// by a bootstrap process that only waits 30 seconds for this process to terminate, so
+    /// any long-running work scheduled after the handoff would cause it to give up.
+    /// </summary>
+    private static async Task TrySelfUpdateAsync(string gameDirectory)
     {
-        GitHubAsset? updaterAsset = release.Assets.FirstOrDefault(asset =>
-            asset.Name.Equals("Updater.exe", StringComparison.OrdinalIgnoreCase));
+        try
+        {
+            await StageSelfUpdateBinaryAsync(gameDirectory);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Updater self-update check failed; the game update is unaffected. ({ex.Message})");
+        }
+    }
+
+    private static async Task StageSelfUpdateBinaryAsync(string gameDirectory)
+    {
+        string expectedAssetName = GetUpdaterAssetName();
+
+        string? currentUpdaterPath = Process.GetCurrentProcess().MainModule?.FileName;
+        if (string.IsNullOrWhiteSpace(currentUpdaterPath))
+        {
+            currentUpdaterPath = Path.Combine(gameDirectory, expectedAssetName);
+        }
+
+        GitHubRelease? toolsRelease;
+        try
+        {
+            toolsRelease = await QueryReleaseByTagAsync(SelfUpdateReleaseTag);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Skipping updater self-update: could not query the '{SelfUpdateReleaseTag}' release ({ex.Message}).");
+            return;
+        }
+
+        GitHubAsset? updaterAsset = toolsRelease?.Assets.FirstOrDefault(asset =>
+            asset.Name.Equals(expectedAssetName, StringComparison.OrdinalIgnoreCase));
 
         if (updaterAsset is null)
         {
-            Console.WriteLine("No Updater.exe self-update asset is present in the latest GitHub release.");
+            Console.WriteLine($"No '{expectedAssetName}' asset is present in the '{SelfUpdateReleaseTag}' release; the updater will not self-update.");
+            return;
+        }
+
+        if (IsUpdaterAlreadyCurrent(currentUpdaterPath, updaterAsset.Digest))
+        {
+            Console.WriteLine("Updater is already the current build.");
             return;
         }
 
@@ -528,18 +601,45 @@ internal static class Program
         await DownloadAssetAsync(updaterAsset.BrowserDownloadUrl, stagedUpdaterPath);
         VerifyAssetDigest(stagedUpdaterPath, updaterAsset.Digest);
 
+        if (OperatingSystem.IsWindows())
+        {
+            HandOffToBootstrap(gameDirectory, currentUpdaterPath, stagedUpdaterPath);
+        }
+        else
+        {
+            SwapSelfInPlace(currentUpdaterPath, stagedUpdaterPath);
+        }
+    }
+
+    private static bool IsUpdaterAlreadyCurrent(string currentUpdaterPath, string? publishedDigest)
+    {
+        if (string.IsNullOrWhiteSpace(publishedDigest) || !File.Exists(currentUpdaterPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(
+                CalculateSha256(currentUpdaterPath),
+                NormalizeHexDigest(publishedDigest),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Could not hash the running updater, so the published build will be fetched. ({ex.Message})");
+            return false;
+        }
+    }
+
+    private static void HandOffToBootstrap(string gameDirectory, string currentUpdaterPath, string stagedUpdaterPath)
+    {
         string bootstrapExe = Path.Combine(gameDirectory, "UpdaterBootstrap.exe");
         if (!File.Exists(bootstrapExe))
         {
             Console.WriteLine(
                 $"Bootstrapper '{bootstrapExe}' is not present in the game directory. Self-update payload was downloaded and staged at '{stagedUpdaterPath}' but cannot be swapped into place.");
             return;
-        }
-
-        string? currentUpdaterPath = Process.GetCurrentProcess().MainModule?.FileName;
-        if (string.IsNullOrWhiteSpace(currentUpdaterPath))
-        {
-            currentUpdaterPath = Path.Combine(gameDirectory, "Updater.exe");
         }
 
         int currentProcessId = Environment.ProcessId;
@@ -554,6 +654,35 @@ internal static class Program
         });
 
         Console.WriteLine($"Staged new updater binary: {stagedUpdaterPath}");
+    }
+
+    private static void SwapSelfInPlace(string currentUpdaterPath, string stagedUpdaterPath)
+    {
+        try
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                // Release assets carry no permission bits, so the download arrives non-executable.
+                File.SetUnixFileMode(
+                    stagedUpdaterPath,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                    | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                    | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            }
+
+            // Renaming over a running executable is legal here: the kernel keeps this
+            // process on the old inode, so no bootstrap handoff is needed. The rename is
+            // atomic, which means a failure leaves the existing updater untouched.
+            File.Move(stagedUpdaterPath, currentUpdaterPath, overwrite: true);
+
+            Console.WriteLine($"Replaced updater binary in place: {currentUpdaterPath}");
+            Console.WriteLine("The new updater takes effect the next time you run it.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: could not replace the updater binary: {ex.Message}");
+            Console.WriteLine($"The new updater was downloaded to '{stagedUpdaterPath}' and can be moved into place manually.");
+        }
     }
 
     private static string NormalizeVersion(string value) => VersionComparer.Normalize(value);
