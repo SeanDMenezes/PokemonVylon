@@ -8,15 +8,15 @@ using PokemonVylon.UpdateIndex;
 
 internal static class Program
 {
-    private const string GitHubOwner = "SeanDMenezes";
-    private const string GitHubRepo = "PokemonVylon";
+    private const string GitHubOwner = UpdateIndexConstants.GitHubOwner;
+    private const string GitHubRepo = UpdateIndexConstants.GitHubRepo;
     private const string UpdaterStagingDirectoryName = ".updater-staging";
-    private const string WindowsUpdaterAssetName = "Updater.exe";
-    private const string LinuxUpdaterAssetName = "Updater-linux-x64";
+    private const string WindowsUpdaterAssetName = UpdateIndexConstants.WindowsUpdaterAssetName;
+    private const string LinuxUpdaterAssetName = UpdateIndexConstants.LinuxUpdaterAssetName;
 
     // The updater ships from a fixed tag rather than the latest game release, so a user
     // who multi-hops across several versions still converges on the current binary.
-    private const string SelfUpdateReleaseTag = "tools";
+    private const string SelfUpdateReleaseTag = UpdateIndexConstants.ToolsReleaseTag;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

@@ -5,6 +5,19 @@ namespace PokemonVylon.UpdateIndex;
 public static class UpdateIndexConstants
 {
     public const string FileName = "update-index.json";
+
+    public const string GitHubOwner = "SeanDMenezes";
+    public const string GitHubRepo = "PokemonVylon";
+
+    /// <summary>
+    /// Fixed release tag hosting the updater and builder binaries. Kept separate from the
+    /// game version sequence so a player who skips releases still converges on the current
+    /// updater.
+    /// </summary>
+    public const string ToolsReleaseTag = "tools";
+
+    public const string WindowsUpdaterAssetName = "Updater.exe";
+    public const string LinuxUpdaterAssetName = "Updater-linux-x64";
 }
 
 public sealed class UpdateIndexManifest

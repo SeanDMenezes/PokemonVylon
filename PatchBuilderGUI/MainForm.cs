@@ -11,8 +11,14 @@ sealed class MainForm : Form
     readonly Button _buildButton = new();
     readonly Button _openOutputButton = new();
     readonly ProgressBar _progressBar = new();
+    readonly TextBox _tokenBox = new();
+    readonly Button _saveTokenButton = new();
+    readonly CheckBox _includeUpdaterCheck = new();
+    readonly Button _publishButton = new();
 
     string? _lastZipPath;
+    PatchBuildResult? _lastBuildResult;
+    string? _lastBuiltToVersion;
     CancellationTokenSource? _buildCts;
 
     public MainForm()
@@ -29,9 +35,10 @@ sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 6,
+            RowCount = 7,
             AutoSize = false
         };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -46,11 +53,13 @@ sealed class MainForm : Form
             Margin = new Padding(0, 0, 0, 12),
             Text =
                 "Build an update patch by picking the old live build folder and the new build folder, " +
-                "then enter the version numbers. Upload the resulting .patch.zip and update-index.json to GitHub."
+                "then enter the version numbers. Publishing creates a GitHub draft release and uploads " +
+                "the assets; you review it and click Publish on GitHub yourself."
         };
 
         var foldersPanel = BuildFoldersPanel();
         var versionsPanel = BuildVersionsPanel();
+        var gitHubPanel = BuildGitHubPanel();
         var actionsPanel = BuildActionsPanel();
         var logPanel = BuildLogPanel();
         var footerPanel = BuildFooterPanel();
@@ -58,11 +67,14 @@ sealed class MainForm : Form
         root.Controls.Add(intro, 0, 0);
         root.Controls.Add(foldersPanel, 0, 1);
         root.Controls.Add(versionsPanel, 0, 2);
-        root.Controls.Add(actionsPanel, 0, 3);
-        root.Controls.Add(logPanel, 0, 4);
-        root.Controls.Add(footerPanel, 0, 5);
+        root.Controls.Add(gitHubPanel, 0, 3);
+        root.Controls.Add(actionsPanel, 0, 4);
+        root.Controls.Add(logPanel, 0, 5);
+        root.Controls.Add(footerPanel, 0, 6);
 
         Controls.Add(root);
+
+        _tokenBox.Text = GitHubTokenStore.Load() ?? "";
 
         _fromVersionBox.TextChanged += (_, _) => RefreshOutputPreview();
         _toVersionBox.TextChanged += (_, _) => RefreshOutputPreview();
@@ -195,6 +207,110 @@ sealed class MainForm : Form
         return panel;
     }
 
+    Control BuildGitHubPanel()
+    {
+        var panel = new TableLayoutPanel
+        {
+            ColumnCount = 3,
+            RowCount = 3,
+            AutoSize = true,
+            Dock = DockStyle.Top,
+            Margin = new Padding(0, 0, 0, 12)
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+
+        var label = new Label
+        {
+            Text = "GitHub token",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 8, 8, 0)
+        };
+
+        _tokenBox.Dock = DockStyle.Fill;
+        _tokenBox.Margin = new Padding(0, 4, 8, 4);
+        _tokenBox.UseSystemPasswordChar = true;
+        _tokenBox.PlaceholderText = "Fine-grained token with Contents: Read and write";
+        _tokenBox.AutoSize = false;
+
+        _saveTokenButton.Text = "Save";
+        _saveTokenButton.Dock = DockStyle.Fill;
+        _saveTokenButton.Margin = new Padding(0, 4, 0, 4);
+        _saveTokenButton.FlatStyle = FlatStyle.System;
+        _saveTokenButton.Click += (_, _) => SaveToken();
+
+        var help = new LinkLabel
+        {
+            Text = "Create a token (scoped to this repository, Contents: Read and write)",
+            AutoSize = true,
+            Margin = new Padding(0, 2, 0, 0)
+        };
+        help.LinkClicked += (_, _) => OpenUrl("https://github.com/settings/personal-access-tokens");
+
+        _includeUpdaterCheck.Text =
+            "Also attach Updater.exe, copied from the tools release (needed until migration ends)";
+        _includeUpdaterCheck.AutoSize = true;
+        _includeUpdaterCheck.Checked = true;
+        _includeUpdaterCheck.Margin = new Padding(0, 6, 0, 0);
+
+        panel.Controls.Add(label, 0, 0);
+        panel.Controls.Add(_tokenBox, 1, 0);
+        panel.Controls.Add(_saveTokenButton, 2, 0);
+
+        panel.SetColumnSpan(help, 2);
+        panel.Controls.Add(help, 1, 1);
+
+        panel.SetColumnSpan(_includeUpdaterCheck, 2);
+        panel.Controls.Add(_includeUpdaterCheck, 1, 2);
+
+        return panel;
+    }
+
+    void SaveToken()
+    {
+        string token = _tokenBox.Text.Trim();
+
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            GitHubTokenStore.Clear();
+            MessageBox.Show(
+                this,
+                "Saved token cleared.",
+                "GitHub token",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            GitHubTokenStore.Save(token);
+            MessageBox.Show(
+                this,
+                "Token saved for this Windows account. It is encrypted and stays on this machine.",
+                "GitHub token",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                "Could not save the token: " + ex.Message,
+                "GitHub token",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+    }
+
+    static void OpenUrl(string url)
+    {
+        System.Diagnostics.Process.Start(
+            new System.Diagnostics.ProcessStartInfo { FileName = url, UseShellExecute = true });
+    }
+
     Control BuildActionsPanel()
     {
         var panel = new FlowLayoutPanel
@@ -211,6 +327,13 @@ sealed class MainForm : Form
         _buildButton.Padding = new Padding(16, 6, 16, 6);
         _buildButton.Click += async (_, _) => await BuildPatchAsync();
 
+        _publishButton.Text = "Publish draft to GitHub";
+        _publishButton.AutoSize = true;
+        _publishButton.Padding = new Padding(16, 6, 16, 6);
+        _publishButton.Margin = new Padding(12, 3, 0, 3);
+        _publishButton.Enabled = false;
+        _publishButton.Click += async (_, _) => await PublishAsync();
+
         _progressBar.Style = ProgressBarStyle.Marquee;
         _progressBar.MarqueeAnimationSpeed = 30;
         _progressBar.Width = 220;
@@ -219,6 +342,7 @@ sealed class MainForm : Form
         _progressBar.Visible = false;
 
         panel.Controls.Add(_buildButton);
+        panel.Controls.Add(_publishButton);
         panel.Controls.Add(_progressBar);
         return panel;
     }
@@ -347,7 +471,10 @@ sealed class MainForm : Form
         SetBusy(true);
         _logBox.Clear();
         _lastZipPath = null;
+        _lastBuildResult = null;
+        _lastBuiltToVersion = null;
         _openOutputButton.Enabled = false;
+        _publishButton.Enabled = false;
 
         var progress = new Progress<string>(AppendLog);
 
@@ -360,7 +487,10 @@ sealed class MainForm : Form
                 _buildCts.Token);
 
             _lastZipPath = result.ZipPath;
+            _lastBuildResult = result;
+            _lastBuiltToVersion = request.ToVersion.Trim();
             _openOutputButton.Enabled = true;
+            _publishButton.Enabled = true;
 
             MessageBox.Show(
                 this,
@@ -370,7 +500,7 @@ sealed class MainForm : Form
                 $"Size: {result.ZipSizeBytes / 1024.0 / 1024.0:F2} MB\n\n" +
                 $"{result.ZipPath}\n" +
                 $"{result.UpdateIndexPath}\n\n" +
-                "Next: upload the .patch.zip and update-index.json to the GitHub release for that version.",
+                "Next: click \"Publish draft to GitHub\".",
                 "Patch ready",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -394,6 +524,105 @@ sealed class MainForm : Form
             SetBusy(false);
             _buildCts.Dispose();
             _buildCts = null;
+        }
+    }
+
+    async Task PublishAsync()
+    {
+        if (_lastBuildResult is null || string.IsNullOrWhiteSpace(_lastBuiltToVersion))
+        {
+            MessageBox.Show(
+                this,
+                "Build a patch first — publishing uploads the files from the most recent build.",
+                "Nothing to publish",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        string token = _tokenBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            MessageBox.Show(
+                this,
+                "Enter a GitHub token first. It needs Contents: Read and write on the game repository.",
+                "Token required",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        var request = new GitHubPublishRequest(
+            token,
+            _lastBuiltToVersion,
+            _lastBuildResult.ZipPath,
+            _lastBuildResult.UpdateIndexPath,
+            _includeUpdaterCheck.Checked);
+
+        _buildCts = new CancellationTokenSource();
+        SetBusy(true);
+
+        try
+        {
+            AppendLog("");
+            AppendLog("Publishing to GitHub as a draft...");
+
+            GitHubPublishResult result = await GitHubPublishService.PublishDraftAsync(
+                request,
+                new Progress<string>(AppendLog),
+                _buildCts.Token);
+
+            AppendLog($"Done. {result.ReleaseUrl}");
+
+            string skipped = result.SkippedAssets.Count > 0
+                ? "\n\nSkipped:\n  " + string.Join("\n  ", result.SkippedAssets)
+                : "";
+
+            string warning = result.AlreadyPublished
+                ? "\n\nWARNING: this release was already published, so players could see it " +
+                  "mid-upload. Normally the draft is only published once uploads finish."
+                : "\n\nIt is still a DRAFT. Review it on GitHub, then click Publish release there.";
+
+            AppendLog(result.AlreadyPublished
+                ? "Release was already published — assets were replaced in place."
+                : "Release left as a draft. Publish it on GitHub when you are happy with it.");
+
+            var open = MessageBox.Show(
+                this,
+                $"Release {result.ReleaseTag} updated.\n\n" +
+                "Uploaded:\n  " + string.Join("\n  ", result.UploadedAssets) +
+                skipped +
+                warning +
+                "\n\nOpen it in your browser now?",
+                "Published",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information);
+
+            if (open == DialogResult.Yes)
+            {
+                OpenUrl(result.ReleaseUrl);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            AppendLog("Publish cancelled.");
+        }
+        catch (Exception ex)
+        {
+            AppendLog("ERROR: " + ex.Message);
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "Publish failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+            _buildCts.Dispose();
+            _buildCts = null;
+            _publishButton.Enabled = true;
         }
     }
 
@@ -436,6 +665,10 @@ sealed class MainForm : Form
         _newFolderBox.Enabled = !busy;
         _fromVersionBox.Enabled = !busy;
         _toVersionBox.Enabled = !busy;
+        _tokenBox.Enabled = !busy;
+        _saveTokenButton.Enabled = !busy;
+        _includeUpdaterCheck.Enabled = !busy;
+        _publishButton.Enabled = !busy && _lastBuildResult is not null;
         _progressBar.Visible = busy;
         UseWaitCursor = busy;
     }
