@@ -61,18 +61,3 @@ sealed record PatchBuildResult(
     long ZipSizeBytes,
     int ChangedOrNewFileCount,
     int DeletedFileCount);
-
-sealed record GitHubPublishRequest(
-    string Token,
-    string ToVersion,
-    string PatchZipPath,
-    string UpdateIndexPath,
-    bool IncludeMigrationUpdater);
-
-sealed record GitHubPublishResult(
-    string ReleaseTag,
-    string ReleaseUrl,
-    bool WasExistingRelease,
-    bool AlreadyPublished,
-    IReadOnlyList<string> UploadedAssets,
-    IReadOnlyList<string> SkippedAssets);

@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using PokemonVylon.UpdateIndex;
 
 namespace PatchBuilderGUI;
 
@@ -88,6 +89,66 @@ static partial class PatchValidation
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Problems that still produce a valid-looking patch, but strand players once the index
+    /// is uploaded. They are warnings rather than errors because a deliberate rebuild of an
+    /// older edge is legitimate.
+    /// </summary>
+    public static IReadOnlyList<string> GetWarnings(PatchBuildRequest request)
+    {
+        var warnings = new List<string>();
+
+        string indexPath;
+        try
+        {
+            indexPath = GetUpdateIndexPath(request.NewFolder);
+        }
+        catch
+        {
+            return warnings;
+        }
+
+        if (!File.Exists(indexPath))
+        {
+            warnings.Add(
+                "No update-index.json was found at:\n" +
+                indexPath + "\n\n" +
+                "Building now starts a brand-new index containing only this one patch. " +
+                "Uploading that would erase every existing update route, and players on older " +
+                "versions would be told to reinstall the game from scratch.\n\n" +
+                "Download update-index.json from the latest GitHub release into that folder first.");
+
+            return warnings;
+        }
+
+        UpdateIndexManifest index;
+        try
+        {
+            index = UpdateIndexBuilder.LoadOrCreate(indexPath);
+        }
+        catch (Exception ex)
+        {
+            warnings.Add($"update-index.json could not be read ({ex.Message}). Building would replace it.");
+            return warnings;
+        }
+
+        string latest = VersionComparer.Normalize(index.Latest);
+        string fromVersion = VersionComparer.Normalize(request.FromVersion.Trim());
+        string toVersion = request.ToVersion.Trim();
+
+        if (!string.IsNullOrWhiteSpace(latest)
+            && !string.Equals(fromVersion, latest, StringComparison.OrdinalIgnoreCase))
+        {
+            warnings.Add(
+                $"This patch starts from {fromVersion}, but the newest version in the index is {latest}.\n\n" +
+                $"Nothing would lead out of {latest}, so anyone already running it could not reach " +
+                $"{toVersion} and their update would fail.\n\n" +
+                $"Unless your old folder is really {latest}, the from version should be {latest}.");
+        }
+
+        return warnings;
     }
 
     public static string GetZipPath(string newFolder, string fromVersion, string toVersion)
